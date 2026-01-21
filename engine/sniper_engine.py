@@ -108,8 +108,9 @@ class SniperEngine:
         get_api_cache().start()
 
         # Start market workers only for enabled markets
+        # Stagger starts to avoid thundering herd
         enabled_count = 0
-        for market in SUPPORTED_MARKETS:
+        for idx, market in enumerate(SUPPORTED_MARKETS):
             symbol = market["symbol"]
             prefix = market["prefix"]
 
@@ -121,13 +122,17 @@ class SniperEngine:
 
             worker = threading.Thread(
                 target=self._market_worker,
-                args=(symbol, prefix),
+                args=(symbol, prefix, idx),  # Pass index for initial jitter
                 daemon=True,
                 name=f"Sniper-{symbol}"
             )
             self._workers[symbol] = worker
             worker.start()
             enabled_count += 1
+
+            # Stagger worker starts by 0.5-1.5 seconds
+            if idx < len(SUPPORTED_MARKETS) - 1:
+                time.sleep(random.uniform(0.5, 1.5))
 
         # Start cleanup worker
         self._cleanup_thread = threading.Thread(
@@ -409,11 +414,15 @@ class SniperEngine:
 
     # ==================== MARKET WORKER ====================
 
-    def _market_worker(self, symbol: str, prefix: str):
+    def _market_worker(self, symbol: str, prefix: str, worker_idx: int = 0):
         """Worker thread for a single market with 3-tier polling"""
-        logging.info(f"[{symbol}] Sniper worker started")
+        logging.info(f"[{symbol}] Sniper worker started (idx={worker_idx})")
 
         last_check_slug = None
+
+        # Add initial jitter based on worker index to spread out first checks
+        initial_jitter = worker_idx * 0.3 + random.uniform(0, 0.5)
+        time.sleep(initial_jitter)
 
         while self._running and not self._state.should_stop():
             try:
