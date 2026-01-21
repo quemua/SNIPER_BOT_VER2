@@ -333,7 +333,8 @@ class SniperEngine:
                     bid_up, bid_down, time_left
                 )
 
-                time.sleep(0.2)
+                # Delay between UP and DOWN to avoid Cloudflare rate limiting
+                time.sleep(0.5 + random.uniform(0, 0.3))
 
                 # Place DOWN order
                 down_order_id = executor.place_buy_order(token_down, sniper_price, order_size)
@@ -347,10 +348,10 @@ class SniperEngine:
                 down_status = f"OK {down_order_id[:16]}..." if down_order_id else "FAILED"
                 logging.info(f"[{symbol}] Sniper orders: UP={up_status}, DOWN={down_status}")
 
-                # Handle partial success - retry failed order once
+                # Handle partial success - retry failed order once (with longer delay for Cloudflare)
                 if up_order_id and not down_order_id:
                     logging.warning(f"[{symbol}] UP ok but DOWN failed. Retrying DOWN...")
-                    time.sleep(0.3)
+                    time.sleep(1.0 + random.uniform(0, 0.5))  # Longer delay to avoid Cloudflare
                     down_order_id = executor.place_buy_order(token_down, sniper_price, order_size)
                     if down_order_id:
                         self._notifier.notify_order_placed(
@@ -360,7 +361,7 @@ class SniperEngine:
 
                 elif down_order_id and not up_order_id:
                     logging.warning(f"[{symbol}] DOWN ok but UP failed. Retrying UP...")
-                    time.sleep(0.3)
+                    time.sleep(1.0 + random.uniform(0, 0.5))  # Longer delay to avoid Cloudflare
                     up_order_id = executor.place_buy_order(token_up, sniper_price, order_size)
                     if up_order_id:
                         self._notifier.notify_order_placed(

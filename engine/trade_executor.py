@@ -63,9 +63,54 @@ _consecutive_failures = 0
 _last_request_time = 0.0
 _request_lock = threading.Lock()
 
+# Cloudflare cooldown management
+_cloudflare_cooldown_until = 0.0
+_cloudflare_lock = threading.Lock()
+CLOUDFLARE_INITIAL_COOLDOWN = 3.0  # 3 seconds after first block
+CLOUDFLARE_MAX_COOLDOWN = 30.0  # Max 30 seconds cooldown
+_cloudflare_consecutive_blocks = 0
+
 # Semaphores for concurrent requests
 CLOB_READ_SEM = threading.BoundedSemaphore(5)
 CLOB_TRADE_SEM = threading.BoundedSemaphore(2)
+
+
+def _check_cloudflare_cooldown() -> bool:
+    """Check if we're in Cloudflare cooldown. Returns True if should wait."""
+    global _cloudflare_cooldown_until
+    with _cloudflare_lock:
+        now = time.time()
+        if now < _cloudflare_cooldown_until:
+            wait_time = _cloudflare_cooldown_until - now
+            logging.debug(f"In Cloudflare cooldown, waiting {wait_time:.1f}s...")
+            time.sleep(wait_time)
+            return True
+        return False
+
+
+def _record_cloudflare_block():
+    """Record a Cloudflare block and set cooldown"""
+    global _cloudflare_cooldown_until, _cloudflare_consecutive_blocks
+    with _cloudflare_lock:
+        _cloudflare_consecutive_blocks += 1
+        # Exponential backoff with cap
+        cooldown = min(
+            CLOUDFLARE_MAX_COOLDOWN,
+            CLOUDFLARE_INITIAL_COOLDOWN * (2 ** (_cloudflare_consecutive_blocks - 1))
+        )
+        # Add jitter
+        cooldown += random.uniform(0.5, 2.0)
+        _cloudflare_cooldown_until = time.time() + cooldown
+        logging.warning(f"Cloudflare block #{_cloudflare_consecutive_blocks}, cooldown {cooldown:.1f}s")
+
+
+def _clear_cloudflare_cooldown():
+    """Clear Cloudflare cooldown on successful request"""
+    global _cloudflare_consecutive_blocks
+    with _cloudflare_lock:
+        if _cloudflare_consecutive_blocks > 0:
+            _cloudflare_consecutive_blocks = 0
+            logging.debug("Cloudflare cooldown cleared after success")
 
 
 def _rate_limit():
@@ -391,6 +436,9 @@ class TradeExecutor:
         last_error = None
         state = get_state_manager()
 
+        # Check Cloudflare cooldown before attempting
+        _check_cloudflare_cooldown()
+
         for attempt in range(max_retries):
             if state.should_stop():
                 logging.warning("Stop requested, aborting buy order")
@@ -411,6 +459,7 @@ class TradeExecutor:
 
                 if order_id:
                     self._record_success()
+                    _clear_cloudflare_cooldown()  # Clear cooldown on success
                     return order_id
 
                 logging.warning(f"No order_id in response: {resp}")
@@ -419,15 +468,17 @@ class TradeExecutor:
                 last_error = e
                 error_str = str(e)
 
-                # Cloudflare block
-                if "403" in error_str and ("cloudflare" in error_str.lower() or "blocked" in error_str.lower()):
+                # Cloudflare block - use global cooldown system
+                if "403" in error_str and ("cloudflare" in error_str.lower() or "<!doctype html>" in error_str.lower()):
                     self._record_failure()
-                    if attempt == 0:
-                        logging.error("Cloudflare block detected!")
+                    _record_cloudflare_block()  # Set global cooldown
                     if attempt < max_retries - 1:
-                        delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
-                        time.sleep(delay)
+                        _check_cloudflare_cooldown()  # Wait for cooldown
                         continue
+                    else:
+                        # Final attempt failed, return early to allow other markets to try later
+                        logging.error(f"Buy order blocked by Cloudflare after {attempt+1} attempts")
+                        return None
 
                 if "Request exception" in error_str:
                     self._record_failure()
