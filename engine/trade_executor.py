@@ -17,6 +17,7 @@ from py_clob_client.order_builder.constants import BUY
 
 from engine.state_manager import get_state_manager
 from engine.logging_config import log_throttled
+from engine.api_cache import get_api_cache
 
 
 # ==================== CONSTANTS ====================
@@ -364,10 +365,18 @@ class TradeExecutor:
         return [], []
 
     def get_best_bid(self, token_id: str) -> float:
-        """Get best bid price for a token"""
+        """Get best bid price for a token (with cache)"""
+        # Check cache first
+        cache = get_api_cache()
+        hit, cached_bid = cache.get_best_bid(token_id)
+        if hit:
+            return cached_bid
+
         bids, _ = self.fetch_orderbook(token_id, max_retries=2)
         if bids and len(bids) > 0:
-            return bids[0][0]
+            best_bid = bids[0][0]
+            cache.set_best_bid(token_id, best_bid, ttl=0.5)
+            return best_bid
         return 0.0
 
     def place_buy_order(self, token_id: str, price: float, size: float, max_retries: int = MAX_RETRIES) -> Optional[str]:

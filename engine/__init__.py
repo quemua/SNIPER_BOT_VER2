@@ -49,6 +49,22 @@ from engine.logging_config import (
     setup_logging,
     setup_headless_logging,
     setup_ui_logging,
+    check_log_disk_usage,
+    cleanup_old_logs,
+)
+
+from engine.api_cache import (
+    APICache,
+    get_api_cache,
+    TTLCache,
+    HostRateLimiter,
+)
+
+from engine.watchdog import (
+    Watchdog,
+    get_watchdog,
+    start_watchdog,
+    stop_watchdog,
 )
 
 __all__ = [
@@ -85,4 +101,18 @@ __all__ = [
     'setup_logging',
     'setup_headless_logging',
     'setup_ui_logging',
+    'check_log_disk_usage',
+    'cleanup_old_logs',
+
+    # API Cache
+    'APICache',
+    'get_api_cache',
+    'TTLCache',
+    'HostRateLimiter',
+
+    # Watchdog
+    'Watchdog',
+    'get_watchdog',
+    'start_watchdog',
+    'stop_watchdog',
 ]
