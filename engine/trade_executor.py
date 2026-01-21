@@ -33,24 +33,19 @@ HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137
 
-# Browser headers for anti-fingerprinting (updated to Chrome 120+)
+# Browser headers - Keep SIMPLE to match what worked before
+# NOTE: sec-ch-ua headers removed - they conflict with Python requests TLS fingerprint
+# and can trigger Cloudflare detection. Real browsers have matching TLS fingerprint,
+# but Python requests does not.
 BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
     'Origin': 'https://polymarket.com',
     'Referer': 'https://polymarket.com/',
     'Connection': 'keep-alive',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
-    # Chrome security headers
-    'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'cross-site',
 }
 
 
@@ -222,27 +217,8 @@ def is_proxy_enabled() -> bool:
 
 
 # ==================== GLOBAL SESSION ====================
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-GLOBAL_SESSION = requests.Session()
-_retries = Retry(
-    total=5,
-    backoff_factor=0.5,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS"]
-)
-_adapter = HTTPAdapter(max_retries=_retries, pool_connections=10, pool_maxsize=20)
-GLOBAL_SESSION.mount('https://', _adapter)
-GLOBAL_SESSION.mount('http://', _adapter)
-GLOBAL_SESSION.verify = True
-GLOBAL_SESSION.headers.update(BROWSER_HEADERS)
-
-# Apply proxy
-_proxy_config = get_proxy_config()
-if _proxy_config:
-    GLOBAL_SESSION.proxies.update(_proxy_config)
+# Import from config.py to avoid duplicate session with different configurations
+from config import GLOBAL_SESSION
 
 
 # ==================== TRADE EXECUTOR ====================
