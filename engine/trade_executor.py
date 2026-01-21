@@ -19,46 +19,18 @@ from engine.state_manager import get_state_manager
 from engine.logging_config import log_throttled
 from engine.api_cache import get_api_cache
 
+# Import from config.py - MUST match original trade_manager.py
+from config import (
+    PRIVATE_KEY, POLY_PROXY_ADDRESS, HOST, CHAIN_ID, GAMMA_API,
+    REQUEST_COOLDOWN, MIN_ORDER_SIZE, BROWSER_HEADERS,
+    get_proxy_config, is_proxy_enabled, GLOBAL_SESSION
+)
+
 
 # ==================== CONSTANTS ====================
 MAX_RETRIES = 5  # Match original trade_manager.py
 RETRY_BASE_DELAY = 0.5
 REINIT_AFTER_FAILS = 10
-REQUEST_COOLDOWN = 0.15  # Match original trade_manager.py
-MIN_ORDER_SIZE = 5.0
-
-# API endpoints
-HOST = "https://clob.polymarket.com"
-GAMMA_API = "https://gamma-api.polymarket.com"
-CHAIN_ID = 137
-
-# Browser headers - Keep SIMPLE to match what worked before
-# NOTE: sec-ch-ua headers removed - they conflict with Python requests TLS fingerprint
-# and can trigger Cloudflare detection. Real browsers have matching TLS fingerprint,
-# but Python requests does not.
-BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://polymarket.com',
-    'Referer': 'https://polymarket.com/',
-    'Connection': 'keep-alive',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
-}
-
-
-def _get_env(key: str, default: str = "") -> str:
-    """Get environment variable with cleanup"""
-    val = os.getenv(key, default)
-    if val:
-        return str(val).strip().replace('"', '').replace("'", "").replace('\n', '').replace('\r', '')
-    return default
-
-
-# Credentials from environment
-PRIVATE_KEY = _get_env("PRIVATE_KEY")
-POLY_PROXY_ADDRESS = _get_env("POLY_PROXY_ADDRESS")
 
 
 # ==================== RATE LIMITING ====================
@@ -81,50 +53,6 @@ def _rate_limit():
         if elapsed < REQUEST_COOLDOWN:
             time.sleep(REQUEST_COOLDOWN - elapsed)
         _last_request_time = time.time()
-
-
-# ==================== PROXY CONFIGURATION ====================
-def get_proxy_config() -> Optional[dict]:
-    """Get proxy configuration from environment"""
-    proxy_url = _get_env("PROXY_URL")
-
-    if not proxy_url:
-        # Try separate params
-        enabled = _get_env("PROXY_ENABLED", "false").lower() == "true"
-        if not enabled:
-            return None
-
-        host = _get_env("PROXY_HOST")
-        if not host:
-            return None
-
-        port = _get_env("PROXY_PORT", "1080")
-        username = _get_env("PROXY_USERNAME")
-        password = _get_env("PROXY_PASSWORD")
-        proxy_type = _get_env("PROXY_TYPE", "socks5")
-
-        auth = f"{username}:{password}@" if username and password else ""
-        scheme = "socks5h" if proxy_type.startswith("socks") else "http"
-        proxy_url = f"{scheme}://{auth}{host}:{port}"
-
-    # Convert socks5 to socks5h for DNS resolution via proxy
-    if proxy_url.startswith("socks5://"):
-        proxy_url = "socks5h://" + proxy_url[9:]
-
-    return {
-        "http": proxy_url,
-        "https": proxy_url
-    }
-
-
-def is_proxy_enabled() -> bool:
-    """Check if proxy is configured"""
-    return get_proxy_config() is not None
-
-
-# ==================== GLOBAL SESSION ====================
-# Import from config.py to avoid duplicate session with different configurations
-from config import GLOBAL_SESSION
 
 
 # ==================== TRADE EXECUTOR ====================
