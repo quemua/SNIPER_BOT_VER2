@@ -33,16 +33,24 @@ HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137
 
-# Browser headers for anti-fingerprinting
+# Browser headers for anti-fingerprinting (updated to Chrome 120+)
 BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Origin': 'https://polymarket.com',
     'Referer': 'https://polymarket.com/',
     'Connection': 'keep-alive',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
+    # Chrome security headers
+    'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
 }
 
 
@@ -67,9 +75,11 @@ _request_lock = threading.Lock()
 # Cloudflare cooldown management
 _cloudflare_cooldown_until = 0.0
 _cloudflare_lock = threading.Lock()
-CLOUDFLARE_INITIAL_COOLDOWN = 5.0  # 5 seconds after first block (increased from 3)
-CLOUDFLARE_MAX_COOLDOWN = 60.0  # Max 60 seconds cooldown (increased from 30)
+CLOUDFLARE_INITIAL_COOLDOWN = 15.0  # 15 seconds after first block (Cloudflare flags for ~10-15s)
+CLOUDFLARE_MAX_COOLDOWN = 120.0  # Max 2 minutes cooldown
+CLOUDFLARE_BACKOFF_MULTIPLIER = 2.5  # More aggressive backoff
 _cloudflare_consecutive_blocks = 0
+_cloudflare_last_block_time = 0.0  # Track when blocks happen
 
 # Semaphores for concurrent requests
 CLOB_READ_SEM = threading.BoundedSemaphore(5)
@@ -111,18 +121,33 @@ def _wait_cloudflare_cooldown():
 
 def _record_cloudflare_block():
     """Record a Cloudflare block and set cooldown"""
-    global _cloudflare_cooldown_until, _cloudflare_consecutive_blocks
+    global _cloudflare_cooldown_until, _cloudflare_consecutive_blocks, _cloudflare_last_block_time
+    now = time.time()
     with _cloudflare_lock:
-        _cloudflare_consecutive_blocks += 1
-        # Exponential backoff with cap
+        # Check if this is a rapid consecutive block (within 30s of last block)
+        # This indicates Cloudflare is aggressively blocking
+        time_since_last = now - _cloudflare_last_block_time if _cloudflare_last_block_time > 0 else 999
+        _cloudflare_last_block_time = now
+
+        if time_since_last < 30:
+            # Rapid blocks - Cloudflare is aggressive, use longer cooldown
+            _cloudflare_consecutive_blocks += 1
+        else:
+            # First block after a while, reset counter but still count this one
+            _cloudflare_consecutive_blocks = 1
+
+        # Exponential backoff with more aggressive multiplier
         cooldown = min(
             CLOUDFLARE_MAX_COOLDOWN,
-            CLOUDFLARE_INITIAL_COOLDOWN * (2 ** (_cloudflare_consecutive_blocks - 1))
+            CLOUDFLARE_INITIAL_COOLDOWN * (CLOUDFLARE_BACKOFF_MULTIPLIER ** (_cloudflare_consecutive_blocks - 1))
         )
-        # Add jitter
-        cooldown += random.uniform(0.5, 2.0)
-        _cloudflare_cooldown_until = time.time() + cooldown
-        logging.warning(f"Cloudflare block #{_cloudflare_consecutive_blocks}, cooldown {cooldown:.1f}s")
+        # Add jitter (more jitter for higher block counts)
+        jitter = random.uniform(1.0, 3.0) * _cloudflare_consecutive_blocks
+        cooldown += jitter
+        cooldown = min(cooldown, CLOUDFLARE_MAX_COOLDOWN)
+
+        _cloudflare_cooldown_until = now + cooldown
+        logging.warning(f"Cloudflare block #{_cloudflare_consecutive_blocks}, cooldown {cooldown:.1f}s (last block {time_since_last:.1f}s ago)")
 
 
 def _clear_cloudflare_cooldown():
