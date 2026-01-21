@@ -72,12 +72,12 @@ _consecutive_failures = 0
 _last_request_time = 0.0
 _request_lock = threading.Lock()
 
-# Cloudflare cooldown management
+# Cloudflare cooldown management - OPTIMIZED FOR 30s SNIPER WINDOW
 _cloudflare_cooldown_until = 0.0
 _cloudflare_lock = threading.Lock()
-CLOUDFLARE_INITIAL_COOLDOWN = 15.0  # 15 seconds after first block (Cloudflare flags for ~10-15s)
-CLOUDFLARE_MAX_COOLDOWN = 120.0  # Max 2 minutes cooldown
-CLOUDFLARE_BACKOFF_MULTIPLIER = 2.5  # More aggressive backoff
+CLOUDFLARE_INITIAL_COOLDOWN = 2.0  # Only 2s - need speed for 30s window
+CLOUDFLARE_MAX_COOLDOWN = 8.0  # Max 8s - can't afford longer
+CLOUDFLARE_BACKOFF_MULTIPLIER = 1.3  # Gentle backoff
 _cloudflare_consecutive_blocks = 0
 _cloudflare_last_block_time = 0.0  # Track when blocks happen
 
