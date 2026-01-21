@@ -27,11 +27,11 @@ from engine.state_manager import (
     StateManager,
     RunMode,
 )
-from engine.trade_executor import (
-    get_trade_executor,
-    TradeExecutor,
-    GLOBAL_SESSION,
+from trade_manager import (
+    get_trade_manager as get_trade_executor,
+    TradeManager as TradeExecutor,
 )
+from config import GLOBAL_SESSION
 from engine.notifier import get_notifier, NotificationManager
 from engine.persistence import get_persistence_manager
 from engine.logging_config import log_throttled
