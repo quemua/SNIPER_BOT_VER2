@@ -9,7 +9,6 @@ FIXED: Added Proxy Support for VPS deployment
 import os
 import sys
 import json
-import ssl
 import requests
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -17,18 +16,10 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Fix SSL/TLS for older Windows Server
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-    if sys.platform == 'win32':
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')
-except:
-    pass
+# NOTE: SSL verification is ALWAYS enabled in production.
+# If you need to debug SSL issues on older Windows, update your CA certificates
+# or Python/OpenSSL version instead of disabling verification.
+# NEVER set verify=False or CERT_NONE in production - MITM attack risk!
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
@@ -181,17 +172,27 @@ def get_proxy_display() -> str:
     return f"{ptype}://{host}:{port} ({has_auth})"
 
 
-# Initialize proxy environment on import
-if is_proxy_enabled():
-    setup_environment_proxy()
-    
-    # Warn if SOCKS without PySocks
-    proxy_type = PROXY_CONFIG["type"].lower()
-    if PROXY_CONFIG["url"]:
-        proxy_type = "socks5" if "socks" in PROXY_CONFIG["url"].lower() else "http"
-    
-    if proxy_type.startswith("socks") and not check_socks_support():
-        print("⚠️ SOCKS proxy requires: pip install PySocks requests[socks]")
+# NOTE: Proxy environment setup is NOT done on import to avoid side effects.
+# Call setup_environment_proxy() explicitly in your entrypoint (run_headless.py, run_ui.py)
+# if you need to set proxy environment variables for external libraries.
+#
+# Recommended: Pass proxies directly to Session/requests instead of setting global env vars.
+
+def init_proxy_if_needed():
+    """
+    Initialize proxy environment if enabled.
+    Call this explicitly from entrypoints, not on import.
+    """
+    if is_proxy_enabled():
+        setup_environment_proxy()
+
+        # Warn if SOCKS without PySocks
+        proxy_type = PROXY_CONFIG["type"].lower()
+        if PROXY_CONFIG["url"]:
+            proxy_type = "socks5" if "socks" in PROXY_CONFIG["url"].lower() else "http"
+
+        if proxy_type.startswith("socks") and not check_socks_support():
+            print("⚠️ SOCKS proxy requires: pip install PySocks requests[socks]")
 
 
 # ==================== SESSION MANAGEMENT ====================
