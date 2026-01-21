@@ -512,7 +512,10 @@ class SniperApp(ctk.CTk):
 
         while self._running and not self._state.should_stop():
             try:
-                time.sleep(interval_seconds)
+                # Use stop_event.wait() instead of time.sleep() for responsive shutdown
+                if self._state.stop_event.wait(timeout=interval_seconds):
+                    break  # Stop was requested
+
                 if not self._running:
                     break
 
@@ -536,14 +539,17 @@ class SniperApp(ctk.CTk):
     def _update_loop(self):
         """UI update loop"""
         try:
-            # Update log
-            while self._log_queue and not self._log_queue.empty():
-                try:
-                    msg = self._log_queue.get_nowait()
-                    self.log_text.insert("end", msg + "\n")
-                    self.log_text.see("end")
-                except:
-                    break
+            # Update log (use get_nowait + Empty exception for thread-safety)
+            if self._log_queue:
+                while True:
+                    try:
+                        msg = self._log_queue.get_nowait()
+                        self.log_text.insert("end", msg + "\n")
+                        self.log_text.see("end")
+                    except queue.Empty:
+                        break
+                    except Exception:
+                        break
 
             # Update balance
             balance = self._state.get_balance()

@@ -13,8 +13,12 @@ from datetime import datetime
 
 from config import (
     BOT_VERSION, SUPPORTED_MARKETS, sniper_config, UI_UPDATE_MS,
-    BALANCE_UPDATE_HOURS, TG_TOKEN, TG_CHAT_ID, is_proxy_enabled
+    BALANCE_UPDATE_HOURS, TG_TOKEN, TG_CHAT_ID, is_proxy_enabled,
+    init_proxy_if_needed
 )
+
+# Initialize proxy environment at entrypoint (not on import)
+init_proxy_if_needed()
 from shared_state import (
     setup_logging, log_queue, shared_data, data_lock, stop_event,
     get_market_status, notify_bot_start, notify_bot_stop, notify_balance_update,
@@ -481,7 +485,10 @@ class SniperApp(ctk.CTk):
 
         while self._running and not stop_event.is_set():
             try:
-                time.sleep(interval_seconds)
+                # Use stop_event.wait() instead of time.sleep() for responsive shutdown
+                # Returns True if event is set (stop requested), False on timeout
+                if stop_event.wait(timeout=interval_seconds):
+                    break  # Stop was requested
 
                 if not self._running:
                     break
@@ -498,13 +505,16 @@ class SniperApp(ctk.CTk):
     def _update_loop(self):
         """UI update loop"""
         try:
-            # Update log
-            while not log_queue.empty():
+            # Update log (use get_nowait + Empty exception for thread-safety)
+            import queue as queue_module
+            while True:
                 try:
                     msg = log_queue.get_nowait()
                     self.log_text.insert("end", msg + "\n")
                     self.log_text.see("end")
-                except:
+                except queue_module.Empty:
+                    break
+                except Exception:
                     break
 
             # Update balance display
