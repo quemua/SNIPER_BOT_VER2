@@ -383,10 +383,20 @@ class SniperApp(ctk.CTk):
     def _save_config_with_feedback(self):
         success = self._save_config()
         if success:
-            self.save_status_label.configure(text="Saved!", text_color="green")
+            # Check if market config changed while engine running (needs restart)
+            if self._running and self._config.needs_restart_for_markets():
+                changed = self._config.get_markets_changed_since_start()
+                self.save_status_label.configure(
+                    text=f"Saved! Restart needed for: {', '.join(changed)}",
+                    text_color="orange"
+                )
+                self.after(5000, lambda: self.save_status_label.configure(text=""))
+            else:
+                self.save_status_label.configure(text="Saved!", text_color="green")
+                self.after(3000, lambda: self.save_status_label.configure(text=""))
         else:
             self.save_status_label.configure(text="Failed!", text_color="red")
-        self.after(3000, lambda: self.save_status_label.configure(text=""))
+            self.after(3000, lambda: self.save_status_label.configure(text=""))
 
     def start(self):
         """Start the sniper bot"""

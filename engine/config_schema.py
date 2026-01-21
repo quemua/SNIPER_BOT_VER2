@@ -161,6 +161,10 @@ class SniperConfigSchema:
     # Balance update interval (hours)
     balance_update_hours: float = 2.0
 
+    # ===== Internal State (not persisted) =====
+    # Snapshot of market enabled states when engine started
+    _engine_start_markets_snapshot: Dict[str, bool] = field(default_factory=dict, repr=False)
+
     def __post_init__(self):
         """Initialize markets if not set"""
         if not self.markets:
@@ -199,6 +203,35 @@ class SniperConfigSchema:
         """Set market enabled state"""
         if symbol in self.markets:
             self.markets[symbol].enabled = enabled
+
+    def snapshot_markets_for_engine(self):
+        """Take a snapshot of current market enabled states when engine starts"""
+        self._engine_start_markets_snapshot = {
+            symbol: cfg.enabled for symbol, cfg in self.markets.items()
+        }
+
+    def needs_restart_for_markets(self) -> bool:
+        """Check if market enabled states changed since engine start (restart needed)"""
+        if not self._engine_start_markets_snapshot:
+            return False  # No snapshot taken yet
+
+        for symbol, cfg in self.markets.items():
+            snapshot_enabled = self._engine_start_markets_snapshot.get(symbol)
+            if snapshot_enabled is not None and cfg.enabled != snapshot_enabled:
+                return True
+        return False
+
+    def get_markets_changed_since_start(self) -> List[str]:
+        """Get list of markets whose enabled state changed since engine start"""
+        changed = []
+        if not self._engine_start_markets_snapshot:
+            return changed
+
+        for symbol, cfg in self.markets.items():
+            snapshot_enabled = self._engine_start_markets_snapshot.get(symbol)
+            if snapshot_enabled is not None and cfg.enabled != snapshot_enabled:
+                changed.append(symbol)
+        return changed
 
     def validate(self) -> 'SniperConfigSchema':
         """

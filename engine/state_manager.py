@@ -373,47 +373,154 @@ class StateManager:
             settlement = self._state["pending_settlements"].get(slug)
             return settlement.symbol if settlement else "UNKNOWN"
 
-    def mark_settlement_resolved(self, slug: str, winner: str, pnl: float):
-        """Mark settlement as resolved"""
+    def mark_settlement_resolved(self, slug: str, winner: str, pnl: float) -> bool:
+        """
+        Mark settlement as resolved (idempotent - only counts PnL once).
+        Returns True if this is the first time resolving, False if already resolved.
+        """
         with self._data_lock:
-            if slug in self._state["pending_settlements"]:
-                settlement = self._state["pending_settlements"][slug]
-                settlement.status = "resolved"
-                settlement.winner = winner
-                settlement.pnl = pnl
+            if slug not in self._state["pending_settlements"]:
+                return False
 
-                if pnl > 0:
-                    self._state["total_wins"] += 1
-                elif pnl < 0:
-                    self._state["total_losses"] += 1
-                self._state["total_pnl"] += pnl
+            settlement = self._state["pending_settlements"][slug]
 
-                self._notify_change("settlement_resolved", {
-                    "slug": slug, "winner": winner, "pnl": pnl
-                })
+            # Idempotent check - don't double-count if already resolved/redeemed
+            if settlement.status in ["resolved", "redeemed"]:
+                return False
 
-    def mark_settlement_redeemed(self, slug: str):
-        """Mark settlement as redeemed"""
+            settlement.status = "resolved"
+            settlement.winner = winner
+            settlement.pnl = pnl
+
+            # Only update stats on first resolution
+            if pnl > 0:
+                self._state["total_wins"] += 1
+            elif pnl < 0:
+                self._state["total_losses"] += 1
+            self._state["total_pnl"] += pnl
+
+            self._notify_change("settlement_resolved", {
+                "slug": slug, "winner": winner, "pnl": pnl
+            })
+            return True
+
+    def mark_settlement_redeemed(self, slug: str) -> bool:
+        """
+        Mark settlement as redeemed (idempotent).
+        Returns True if transition successful, False if already redeemed or invalid.
+        """
         with self._data_lock:
-            if slug in self._state["pending_settlements"]:
-                self._state["pending_settlements"][slug].status = "redeemed"
+            if slug not in self._state["pending_settlements"]:
+                return False
+
+            settlement = self._state["pending_settlements"][slug]
+
+            # Idempotent check - can only transition to redeemed from resolved
+            if settlement.status == "redeemed":
+                return False  # Already redeemed
+
+            if settlement.status != "resolved":
+                # Can only redeem after resolved (warn but allow for edge cases)
+                pass
+
+            settlement.status = "redeemed"
 
             # Cleanup order_ids
             if slug in self._state["order_ids"]:
                 del self._state["order_ids"][slug]
 
-    def cleanup_old_settlements(self, max_age_seconds: float = 86400):
-        """Clean up old settled records"""
+            return True
+
+    def mark_settlement_stale(self, slug: str) -> bool:
+        """
+        Mark settlement as stale (reduced polling). Idempotent.
+        Returns True if transition successful.
+        """
+        with self._data_lock:
+            if slug not in self._state["pending_settlements"]:
+                return False
+
+            settlement = self._state["pending_settlements"][slug]
+
+            # Only pending can become stale
+            if settlement.status != "pending":
+                return False
+
+            settlement.status = "stale"
+            return True
+
+    def mark_settlement_abandoned(self, slug: str) -> bool:
+        """
+        Mark settlement as abandoned (stop polling). Idempotent.
+        Returns True if transition successful.
+        """
+        with self._data_lock:
+            if slug not in self._state["pending_settlements"]:
+                return False
+
+            settlement = self._state["pending_settlements"][slug]
+
+            # Only stale can become abandoned
+            if settlement.status != "stale":
+                return False
+
+            settlement.status = "abandoned"
+            return True
+
+    def mark_settlement_timeout_notified(self, slug: str) -> bool:
+        """Mark that timeout notification was sent. Idempotent."""
+        with self._data_lock:
+            if slug not in self._state["pending_settlements"]:
+                return False
+
+            settlement = self._state["pending_settlements"][slug]
+            if settlement.timeout_notified:
+                return False  # Already notified
+
+            settlement.timeout_notified = True
+            return True
+
+    def schedule_settlement_first_poll(self, slug: str, scheduled_time: float) -> bool:
+        """Schedule the first poll time for a settlement (before expiry)."""
+        with self._data_lock:
+            if slug not in self._state["pending_settlements"]:
+                return False
+
+            settlement = self._state["pending_settlements"][slug]
+            # Only schedule if not already polled
+            if settlement.poll_attempts > 0:
+                return False
+
+            settlement.last_poll_time = scheduled_time
+            return True
+
+    def record_settlement_poll_attempt(self, slug: str, timestamp: float) -> bool:
+        """Record a poll attempt for a settlement."""
+        with self._data_lock:
+            if slug not in self._state["pending_settlements"]:
+                return False
+
+            settlement = self._state["pending_settlements"][slug]
+            settlement.poll_attempts += 1
+            settlement.last_poll_time = timestamp
+            return True
+
+    def cleanup_old_settlements(self, max_age_seconds: float = 86400) -> int:
+        """
+        Clean up old settled/abandoned records.
+        Returns number of cleaned up records.
+        """
         now = time.time()
         cutoff = now - max_age_seconds
 
         with self._data_lock:
             old_slugs = [
                 slug for slug, data in self._state["pending_settlements"].items()
-                if data.status == "redeemed" and data.created_at < cutoff
+                if data.status in ["redeemed", "abandoned"] and data.created_at < cutoff
             ]
             for slug in old_slugs:
                 del self._state["pending_settlements"][slug]
+            return len(old_slugs)
 
     def get_settlement_stats(self) -> Dict[str, Any]:
         """Get settlement statistics"""

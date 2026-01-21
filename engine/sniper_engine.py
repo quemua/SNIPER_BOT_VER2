@@ -100,6 +100,9 @@ class SniperEngine:
 
         config = get_config()
 
+        # Take snapshot of current market enabled states for restart detection
+        config.snapshot_markets_for_engine()
+
         # Start API cache
         from engine.api_cache import get_api_cache
         get_api_cache().start()
@@ -514,7 +517,11 @@ class SniperEngine:
                 orders_checked_this_cycle = 0
                 max_orders_per_cycle = 10  # Prevent API burst
 
-                for slug, orders in order_ids.items():
+                # Shuffle order list each cycle for fairness (prevent starvation)
+                order_items = list(order_ids.items())
+                random.shuffle(order_items)
+
+                for slug, orders in order_items:
                     if self._state.should_stop():
                         break
 
@@ -750,38 +757,26 @@ class SniperEngine:
         logging.info("Settlement watcher stopped")
 
     def _mark_settlement_stale(self, slug: str, settlement):
-        """Mark settlement as stale (reduced polling)"""
-        with self._state._data_lock:
-            if slug in self._state._state["pending_settlements"]:
-                self._state._state["pending_settlements"][slug].status = "stale"
-                self._persistence.mark_dirty()
+        """Mark settlement as stale (reduced polling) - uses StateManager for atomicity"""
+        if self._state.mark_settlement_stale(slug):
+            self._persistence.mark_dirty()
 
     def _mark_settlement_timeout_notified(self, slug: str):
-        """Mark that timeout notification was sent"""
-        with self._state._data_lock:
-            if slug in self._state._state["pending_settlements"]:
-                self._state._state["pending_settlements"][slug].timeout_notified = True
+        """Mark that timeout notification was sent - uses StateManager"""
+        self._state.mark_settlement_timeout_notified(slug)
 
     def _mark_settlement_abandoned(self, slug: str):
-        """Mark settlement as abandoned (stop polling)"""
-        with self._state._data_lock:
-            if slug in self._state._state["pending_settlements"]:
-                self._state._state["pending_settlements"][slug].status = "abandoned"
-                self._persistence.mark_dirty()
+        """Mark settlement as abandoned (stop polling) - uses StateManager"""
+        if self._state.mark_settlement_abandoned(slug):
+            self._persistence.mark_dirty()
 
     def _schedule_first_poll(self, slug: str, scheduled_time: float):
         """Schedule the first poll time for a settlement (before expiry)"""
-        with self._state._data_lock:
-            if slug in self._state._state["pending_settlements"]:
-                # Store scheduled time in last_poll_time (poll_attempts stays 0)
-                self._state._state["pending_settlements"][slug].last_poll_time = scheduled_time
+        self._state.schedule_settlement_first_poll(slug, scheduled_time)
 
     def _record_poll_attempt(self, slug: str, timestamp: float):
         """Record a poll attempt for a settlement"""
-        with self._state._data_lock:
-            if slug in self._state._state["pending_settlements"]:
-                self._state._state["pending_settlements"][slug].poll_attempts += 1
-                self._state._state["pending_settlements"][slug].last_poll_time = timestamp
+        self._state.record_settlement_poll_attempt(slug, timestamp)
 
     def _handle_settlement_resolved(self, executor, slug: str, settlement, winner_outcome: str):
         """Handle a resolved settlement"""
@@ -855,18 +850,10 @@ class SniperEngine:
         self._persistence.mark_dirty()
 
     def _cleanup_old_settlements(self, cleanup_hours: float):
-        """Cleanup old settlements (abandoned + old redeemed)"""
-        now = time.time()
-        cutoff = now - (cleanup_hours * 3600)
-
-        with self._state._data_lock:
-            old_slugs = [
-                slug for slug, data in self._state._state["pending_settlements"].items()
-                if data.status in ["redeemed", "abandoned"] and data.created_at < cutoff
-            ]
-            for slug in old_slugs:
-                del self._state._state["pending_settlements"][slug]
-                logging.debug(f"Cleaned up old settlement: {slug[-20:]}")
+        """Cleanup old settlements (abandoned + old redeemed) - uses StateManager"""
+        cleaned = self._state.cleanup_old_settlements(max_age_seconds=cleanup_hours * 3600)
+        if cleaned > 0:
+            logging.debug(f"Cleaned up {cleaned} old settlement(s)")
 
     def _cleanup_worker(self):
         """Cleanup worker for old records"""
