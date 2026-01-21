@@ -486,13 +486,19 @@ class SniperEngine:
         - Dense polling 0-120s after order placed
         - Sparse polling after
         - Notify once per side
+        - Rate limited to prevent API burst
         """
         logging.info("Fill monitor started")
         config = get_config()
         fm_config = config.fill_monitor
 
-        # Track order placement time
+        # Track order placement time and last check time
         order_times: Dict[str, float] = {}
+        last_check_times: Dict[str, float] = {}
+
+        # Get rate limiter
+        from engine.api_cache import get_api_cache
+        api_cache = get_api_cache()
 
         while self._running and not self._state.should_stop():
             try:
@@ -504,8 +510,16 @@ class SniperEngine:
                 order_ids = self._state.get_order_ids()
                 now = time.time()
 
+                # Limit how many orders we check per cycle to prevent burst
+                orders_checked_this_cycle = 0
+                max_orders_per_cycle = 10  # Prevent API burst
+
                 for slug, orders in order_ids.items():
                     if self._state.should_stop():
+                        break
+
+                    # Limit orders per cycle
+                    if orders_checked_this_cycle >= max_orders_per_cycle:
                         break
 
                     up_id = orders.get("up")
@@ -521,7 +535,7 @@ class SniperEngine:
                     if order_age > fm_config.max_monitor_duration:
                         continue
 
-                    # Determine polling phase
+                    # Determine polling phase and interval
                     if order_age <= fm_config.dense_duration:
                         # Dense phase
                         interval = random.uniform(fm_config.dense_min_interval, fm_config.dense_max_interval)
@@ -529,7 +543,20 @@ class SniperEngine:
                         # Sparse phase
                         interval = random.uniform(fm_config.sparse_min_interval, fm_config.sparse_max_interval)
 
+                    # Check if enough time has passed since last check for this slug
+                    last_check = last_check_times.get(slug, 0)
+                    if now - last_check < interval:
+                        continue
+
+                    # Acquire rate limit before API calls
+                    if not api_cache.acquire_rate_limit("clob.polymarket.com", timeout=2.0):
+                        logging.debug("Fill monitor rate limited, waiting...")
+                        time.sleep(0.5)
+                        continue
+
                     symbol = self._state.get_settlement_symbol(slug)
+                    last_check_times[slug] = now
+                    orders_checked_this_cycle += 1
 
                     # Check UP order
                     if up_id:
@@ -551,6 +578,9 @@ class SniperEngine:
                         except Exception as e:
                             log_throttled("fill_up", str(e))
 
+                    # Small delay between UP and DOWN check
+                    time.sleep(0.1)
+
                     # Check DOWN order
                     if down_id:
                         try:
@@ -571,12 +601,15 @@ class SniperEngine:
                         except Exception as e:
                             log_throttled("fill_down", str(e))
 
-                    time.sleep(0.5)
+                    # Delay between slugs to spread out API calls
+                    time.sleep(0.3)
 
-                # Cleanup old order times
+                # Cleanup old order times and last check times
                 old_slugs = [s for s, t in order_times.items() if now - t > fm_config.max_monitor_duration + 60]
                 for s in old_slugs:
                     del order_times[s]
+                    if s in last_check_times:
+                        del last_check_times[s]
 
                 # Base sleep
                 time.sleep(5)
@@ -628,8 +661,16 @@ class SniperEngine:
                     # Calculate time since expiry
                     time_since_expiry = now - expiry_ts
 
-                    # Don't poll before expiry
+                    # Before expiry - schedule first poll time and skip
                     if time_since_expiry < 0:
+                        # Schedule first poll if not already scheduled
+                        if settlement.poll_attempts == 0 and settlement.last_poll_time == 0:
+                            # Set scheduled first poll time: expiry + random initial delay
+                            scheduled_time = expiry_ts + random.uniform(
+                                s_config.initial_delay_min, s_config.initial_delay_max
+                            )
+                            self._schedule_first_poll(slug, scheduled_time)
+                            logging.debug(f"[{symbol}] Scheduled first poll for {scheduled_time - now:.1f}s from now")
                         continue
 
                     # Check if should transition to stale
@@ -660,8 +701,16 @@ class SniperEngine:
                     if settlement.status == "stale":
                         poll_interval = s_config.stale_check_interval
                     elif settlement.poll_attempts == 0:
-                        # Initial delay
-                        poll_interval = random.uniform(s_config.initial_delay_min, s_config.initial_delay_max)
+                        # First poll - use scheduled time if available
+                        if settlement.last_poll_time > 0:
+                            # We have a scheduled first poll time
+                            if now < settlement.last_poll_time:
+                                continue  # Not yet time for first poll
+                            # Time for first poll - proceed
+                            poll_interval = 0  # Will poll now
+                        else:
+                            # No scheduled time - use initial delay from now
+                            poll_interval = random.uniform(s_config.initial_delay_min, s_config.initial_delay_max)
                     elif settlement.poll_attempts <= 5:
                         poll_interval = s_config.min_interval
                     else:
@@ -669,10 +718,11 @@ class SniperEngine:
                         poll_interval = min(s_config.max_interval,
                                           s_config.min_interval * (s_config.backoff_multiplier ** (settlement.poll_attempts - 5)))
 
-                    # Check if it's time to poll
-                    next_poll_time = settlement.last_poll_time + poll_interval
-                    if settlement.last_poll_time > 0 and now < next_poll_time:
-                        continue
+                    # Check if it's time to poll (skip for first poll with scheduled time)
+                    if settlement.poll_attempts > 0 or settlement.last_poll_time == 0:
+                        next_poll_time = settlement.last_poll_time + poll_interval
+                        if settlement.last_poll_time > 0 and now < next_poll_time:
+                            continue
 
                     # Record poll attempt
                     self._record_poll_attempt(slug, now)
@@ -718,6 +768,13 @@ class SniperEngine:
             if slug in self._state._state["pending_settlements"]:
                 self._state._state["pending_settlements"][slug].status = "abandoned"
                 self._persistence.mark_dirty()
+
+    def _schedule_first_poll(self, slug: str, scheduled_time: float):
+        """Schedule the first poll time for a settlement (before expiry)"""
+        with self._state._data_lock:
+            if slug in self._state._state["pending_settlements"]:
+                # Store scheduled time in last_poll_time (poll_attempts stays 0)
+                self._state._state["pending_settlements"][slug].last_poll_time = scheduled_time
 
     def _record_poll_attempt(self, slug: str, timestamp: float):
         """Record a poll attempt for a settlement"""
