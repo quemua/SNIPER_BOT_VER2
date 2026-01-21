@@ -83,7 +83,8 @@ def main():
     from engine.logging_config import setup_headless_logging
     from engine.config_schema import load_config, get_config
     from engine.state_manager import get_state_manager, RunMode
-    from engine.trade_executor import init_trade_executor, is_proxy_enabled
+    from trade_manager import init_trade_manager as init_trade_executor
+    from config import is_proxy_enabled
     from engine.sniper_engine import get_sniper_engine, start_engine, stop_engine
     from engine.notifier import get_notifier, init_notifier
     from engine.persistence import get_persistence_manager, restore_state_if_available
@@ -114,7 +115,7 @@ def main():
             logging.info("No previous state to restore")
 
     # Initialize notifier with proxy config
-    from engine.trade_executor import get_proxy_config
+    from config import get_proxy_config
     proxy_config = get_proxy_config()
     notifier = init_notifier(proxy_config=proxy_config)
     logging.info(f"Notifier initialized (Telegram: {'enabled' if notifier.telegram_enabled else 'disabled'})")

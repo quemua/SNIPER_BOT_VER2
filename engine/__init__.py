@@ -27,10 +27,10 @@ from engine.state_manager import (
     RunMode,
 )
 
-from engine.trade_executor import (
-    TradeExecutor,
-    get_trade_executor,
-    init_trade_executor,
+from trade_manager import (
+    TradeManager as TradeExecutor,
+    get_trade_manager as get_trade_executor,
+    init_trade_manager as init_trade_executor,
 )
 
 from engine.sniper_engine import (

@@ -54,7 +54,8 @@ class SniperApp(ctk.CTk):
         from engine.logging_config import setup_ui_logging
         from engine.config_schema import load_config, save_config, get_config, SUPPORTED_MARKETS
         from engine.state_manager import get_state_manager, RunMode
-        from engine.trade_executor import init_trade_executor, get_trade_executor, is_proxy_enabled
+        from trade_manager import init_trade_manager as init_trade_executor, get_trade_manager as get_trade_executor
+        from config import is_proxy_enabled
         from engine.sniper_engine import get_sniper_engine, start_engine, stop_engine
         from engine.notifier import init_notifier, get_notifier
         from engine.persistence import restore_state_if_available
