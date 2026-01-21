@@ -21,11 +21,10 @@ from engine.api_cache import get_api_cache
 
 
 # ==================== CONSTANTS ====================
-MAX_RETRIES = 3  # Reduced from 5 - retrying doesn't help with Cloudflare
+MAX_RETRIES = 5  # Match original trade_manager.py
 RETRY_BASE_DELAY = 0.5
 REINIT_AFTER_FAILS = 10
-REQUEST_COOLDOWN_BASE = 0.30  # Base cooldown (increased from 0.15)
-REQUEST_COOLDOWN_MAX = 2.0  # Max cooldown when under pressure
+REQUEST_COOLDOWN = 0.15  # Match original trade_manager.py
 MIN_ORDER_SIZE = 5.0
 
 # API endpoints
@@ -63,117 +62,24 @@ POLY_PROXY_ADDRESS = _get_env("POLY_PROXY_ADDRESS")
 
 
 # ==================== RATE LIMITING ====================
+# Simplified to match original trade_manager.py
 _consecutive_failures = 0
 _last_request_time = 0.0
 _request_lock = threading.Lock()
-
-# Cloudflare cooldown management - OPTIMIZED FOR 30s SNIPER WINDOW
-_cloudflare_cooldown_until = 0.0
-_cloudflare_lock = threading.Lock()
-CLOUDFLARE_INITIAL_COOLDOWN = 2.0  # Only 2s - need speed for 30s window
-CLOUDFLARE_MAX_COOLDOWN = 8.0  # Max 8s - can't afford longer
-CLOUDFLARE_BACKOFF_MULTIPLIER = 1.3  # Gentle backoff
-_cloudflare_consecutive_blocks = 0
-_cloudflare_last_block_time = 0.0  # Track when blocks happen
 
 # Semaphores for concurrent requests
 CLOB_READ_SEM = threading.BoundedSemaphore(5)
 CLOB_TRADE_SEM = threading.BoundedSemaphore(2)
 
 
-def _check_cloudflare_cooldown() -> float:
-    """
-    Check if we're in Cloudflare cooldown.
-    Returns wait_time if should wait (caller must sleep OUTSIDE this function).
-    Returns 0 if no wait needed.
-
-    IMPORTANT: Caller must sleep AFTER calling this, not inside lock!
-    """
-    global _cloudflare_cooldown_until
-    with _cloudflare_lock:
-        now = time.time()
-        if now < _cloudflare_cooldown_until:
-            wait_time = _cloudflare_cooldown_until - now
-            return wait_time
-        return 0.0
-
-
-def _wait_cloudflare_cooldown():
-    """
-    Wait for Cloudflare cooldown if active.
-    Sleep is done OUTSIDE the lock to avoid thundering herd.
-    """
-    wait_time = _check_cloudflare_cooldown()
-    if wait_time > 0:
-        # Add jitter to prevent all threads waking at same time
-        jitter = random.uniform(0.1, 0.5)
-        total_wait = wait_time + jitter
-        logging.debug(f"In Cloudflare cooldown, waiting {total_wait:.1f}s...")
-        time.sleep(total_wait)
-        return True
-    return False
-
-
-def _record_cloudflare_block():
-    """Record a Cloudflare block and set cooldown"""
-    global _cloudflare_cooldown_until, _cloudflare_consecutive_blocks, _cloudflare_last_block_time
-    now = time.time()
-    with _cloudflare_lock:
-        # Check if this is a rapid consecutive block (within 30s of last block)
-        # This indicates Cloudflare is aggressively blocking
-        time_since_last = now - _cloudflare_last_block_time if _cloudflare_last_block_time > 0 else 999
-        _cloudflare_last_block_time = now
-
-        if time_since_last < 30:
-            # Rapid blocks - Cloudflare is aggressive, use longer cooldown
-            _cloudflare_consecutive_blocks += 1
-        else:
-            # First block after a while, reset counter but still count this one
-            _cloudflare_consecutive_blocks = 1
-
-        # Exponential backoff with more aggressive multiplier
-        cooldown = min(
-            CLOUDFLARE_MAX_COOLDOWN,
-            CLOUDFLARE_INITIAL_COOLDOWN * (CLOUDFLARE_BACKOFF_MULTIPLIER ** (_cloudflare_consecutive_blocks - 1))
-        )
-        # Add jitter (more jitter for higher block counts)
-        jitter = random.uniform(1.0, 3.0) * _cloudflare_consecutive_blocks
-        cooldown += jitter
-        cooldown = min(cooldown, CLOUDFLARE_MAX_COOLDOWN)
-
-        _cloudflare_cooldown_until = now + cooldown
-        logging.warning(f"Cloudflare block #{_cloudflare_consecutive_blocks}, cooldown {cooldown:.1f}s (last block {time_since_last:.1f}s ago)")
-
-
-def _clear_cloudflare_cooldown():
-    """Clear Cloudflare cooldown on successful request"""
-    global _cloudflare_consecutive_blocks
-    with _cloudflare_lock:
-        if _cloudflare_consecutive_blocks > 0:
-            _cloudflare_consecutive_blocks = 0
-            logging.debug("Cloudflare cooldown cleared after success")
-
-
-def _get_adaptive_cooldown() -> float:
-    """Get adaptive cooldown based on Cloudflare pressure"""
-    # If we've had recent Cloudflare blocks, increase cooldown
-    with _cloudflare_lock:
-        if _cloudflare_consecutive_blocks > 0:
-            # Increase cooldown proportionally to consecutive blocks
-            multiplier = min(4.0, 1.0 + (_cloudflare_consecutive_blocks * 0.5))
-            return min(REQUEST_COOLDOWN_MAX, REQUEST_COOLDOWN_BASE * multiplier)
-    return REQUEST_COOLDOWN_BASE
-
-
 def _rate_limit():
-    """Apply adaptive rate limiting between requests"""
+    """Apply rate limiting between requests (matching original trade_manager.py)"""
     global _last_request_time
-    cooldown = _get_adaptive_cooldown()
     with _request_lock:
         now = time.time()
         elapsed = now - _last_request_time
-        if elapsed < cooldown:
-            time.sleep(cooldown - elapsed)
+        if elapsed < REQUEST_COOLDOWN:
+            time.sleep(REQUEST_COOLDOWN - elapsed)
         _last_request_time = time.time()
 
 
@@ -234,20 +140,33 @@ class TradeExecutor:
         self.init_client()
 
     def _patch_client_session(self, client):
-        """Patch ClobClient session with browser headers and proxy"""
+        """Patch ClobClient session with browser-like headers and proxy (matching original trade_manager.py)"""
         try:
             proxy_config = get_proxy_config()
 
-            sessions = []
-            for attr in ['session', '_session']:
-                if hasattr(client, attr):
-                    sessions.append(getattr(client, attr))
+            # Patch ALL possible session attributes (critical for proxy to work!)
+            sessions_to_patch = []
 
-            for session in sessions:
+            if hasattr(client, 'session'):
+                sessions_to_patch.append(client.session)
+            if hasattr(client, '_session'):
+                sessions_to_patch.append(client._session)
+            if hasattr(client, 'host') and hasattr(client.host, 'session'):
+                sessions_to_patch.append(client.host.session)
+
+            # Also check for http_helpers or similar
+            if hasattr(client, 'http_helpers'):
+                if hasattr(client.http_helpers, 'session'):
+                    sessions_to_patch.append(client.http_helpers.session)
+
+            for session in sessions_to_patch:
                 if session:
                     session.headers.update(BROWSER_HEADERS)
                     if proxy_config:
                         session.proxies.update(proxy_config)
+
+            if proxy_config:
+                logging.debug(f"Patched {len(sessions_to_patch)} sessions with proxy")
 
         except Exception as e:
             logging.debug(f"Patch session: {e}")
@@ -459,7 +378,10 @@ class TradeExecutor:
         return 0.0
 
     def place_buy_order(self, token_id: str, price: float, size: float, max_retries: int = MAX_RETRIES) -> Optional[str]:
-        """Place BUY order. Returns order_id on success."""
+        """
+        Place BUY order with retry logic (matching original trade_manager.py).
+        Returns order_id on success, None on failure.
+        """
         if not self.ready:
             return None
 
@@ -470,18 +392,10 @@ class TradeExecutor:
         last_error = None
         state = get_state_manager()
 
-        # Wait for Cloudflare cooldown before attempting (sleep OUTSIDE lock)
-        _wait_cloudflare_cooldown()
-
         for attempt in range(max_retries):
             if state.should_stop():
                 logging.warning("Stop requested, aborting buy order")
                 return None
-
-            # Check cooldown again before each attempt (in case another thread triggered it)
-            if _check_cloudflare_cooldown() > 0:
-                logging.debug("Cloudflare cooldown active, skipping order attempt")
-                return None  # Don't retry during cooldown, let other markets try later
 
             try:
                 _rate_limit()
@@ -498,7 +412,6 @@ class TradeExecutor:
 
                 if order_id:
                     self._record_success()
-                    _clear_cloudflare_cooldown()  # Clear cooldown on success
                     return order_id
 
                 logging.warning(f"No order_id in response: {resp}")
@@ -507,18 +420,24 @@ class TradeExecutor:
                 last_error = e
                 error_str = str(e)
 
-                # Cloudflare block - STOP IMMEDIATELY, no retry
-                # Retrying makes it worse with Cloudflare
-                if "403" in error_str and ("cloudflare" in error_str.lower() or "<!doctype html>" in error_str.lower()):
+                # Check for Cloudflare block - retry with backoff (like original)
+                if "403" in error_str and ("cloudflare" in error_str.lower() or "blocked" in error_str.lower()):
                     self._record_failure()
-                    _record_cloudflare_block()  # Set global cooldown
-                    logging.error(f"Cloudflare 403 detected, stopping immediately (no retry)")
-                    return None  # Don't retry at all - let cooldown handle it
+                    if attempt == 0:
+                        logging.error(f"Cloudflare block detected! IP may be blocked.")
+                        if not is_proxy_enabled():
+                            logging.error("   TIP: Add PROXY_URL to .env file to bypass")
+                    if attempt < max_retries - 1:
+                        delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                        logging.warning(f"Cloudflare block, retry in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
 
-                if "Request exception" in error_str:
+                if "Request exception" in error_str or "status_code=None" in error_str:
                     self._record_failure()
                     if attempt < max_retries - 1:
-                        delay = RETRY_BASE_DELAY * (2 ** attempt)
+                        delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.5)
+                        logging.warning(f"Request exception, retry in {delay:.1f}s...")
                         time.sleep(delay)
                         continue
 
@@ -528,6 +447,7 @@ class TradeExecutor:
 
                 if attempt < max_retries - 1:
                     delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    logging.warning(f"Order error, retry in {delay:.1f}s: {error_str[:60]}")
                     time.sleep(delay)
                     continue
 
