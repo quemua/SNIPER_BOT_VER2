@@ -100,10 +100,21 @@ class SniperEngine:
 
         config = get_config()
 
-        # Start market workers
+        # Start API cache
+        from engine.api_cache import get_api_cache
+        get_api_cache().start()
+
+        # Start market workers only for enabled markets
+        enabled_count = 0
         for market in SUPPORTED_MARKETS:
             symbol = market["symbol"]
             prefix = market["prefix"]
+
+            # Skip disabled markets to save threads
+            if not config.is_market_enabled(symbol):
+                logging.info(f"[{symbol}] Market disabled, skipping worker")
+                self._state.set_market_status(symbol, "status", "Disabled")
+                continue
 
             worker = threading.Thread(
                 target=self._market_worker,
@@ -113,6 +124,7 @@ class SniperEngine:
             )
             self._workers[symbol] = worker
             worker.start()
+            enabled_count += 1
 
         # Start cleanup worker
         self._cleanup_thread = threading.Thread(
@@ -141,7 +153,7 @@ class SniperEngine:
         # Start persistence auto-save
         self._persistence.start_auto_save()
 
-        logging.info(f"Sniper Engine STARTED for {len(SUPPORTED_MARKETS)} markets")
+        logging.info(f"Sniper Engine STARTED for {enabled_count}/{len(SUPPORTED_MARKETS)} enabled markets")
 
     def stop(self):
         """Stop the sniper engine"""
@@ -584,17 +596,16 @@ class SniperEngine:
         - next_check = expiry_ts + 8-15s
         - Backoff cap 60s
         - Give up after 30 minutes + notify once
+        - Stale state after max_attempts (reduced polling)
+        - Abandoned state after stale_max_age_hours
         """
         logging.info("Settlement watcher started")
-        config = get_config()
-        s_config = config.settlement
-
-        # Track per-market state
-        poll_state: Dict[str, dict] = {}
-        timeout_notified: set = set()  # Track which markets we've notified about timeout
 
         while self._running and not self._state.should_stop():
             try:
+                config = get_config()
+                s_config = config.settlement
+
                 executor = get_trade_executor()
                 if not executor or not executor.ready:
                     time.sleep(10)
@@ -607,135 +618,78 @@ class SniperEngine:
                     if self._state.should_stop():
                         break
 
-                    # Skip if already resolved
-                    if settlement.status != "pending":
+                    # Skip if already resolved or abandoned
+                    if settlement.status in ["resolved", "redeemed", "abandoned"]:
                         continue
 
+                    symbol = settlement.symbol
                     expiry_ts = settlement.expiry_ts
 
-                    # Initialize poll state
-                    if slug not in poll_state:
-                        # Initial delay: expiry + 8-15s random
-                        initial_delay = random.uniform(s_config.initial_delay_min, s_config.initial_delay_max)
-                        poll_state[slug] = {
-                            "next_check": expiry_ts + initial_delay,
-                            "attempts": 0,
-                            "interval": s_config.min_interval,
-                            "start_time": max(now, expiry_ts),
-                        }
+                    # Calculate time since expiry
+                    time_since_expiry = now - expiry_ts
 
-                    state = poll_state[slug]
-
-                    # Don't check before scheduled time
-                    if now < state["next_check"]:
+                    # Don't poll before expiry
+                    if time_since_expiry < 0:
                         continue
+
+                    # Check if should transition to stale
+                    if settlement.status == "pending":
+                        if settlement.poll_attempts >= s_config.max_attempts:
+                            self._mark_settlement_stale(slug, settlement)
+                            logging.warning(f"[{symbol}] Settlement marked STALE after {settlement.poll_attempts} attempts")
+                            continue
+                        elif time_since_expiry > s_config.max_wait_minutes * 60:
+                            # Timeout - notify and mark stale
+                            if not settlement.timeout_notified:
+                                logging.warning(f"[{symbol}] Settlement timeout after {settlement.poll_attempts} attempts")
+                                if s_config.notify_once_on_timeout:
+                                    self._notifier.notify_settlement_timeout(symbol, slug, settlement.poll_attempts)
+                                self._mark_settlement_timeout_notified(slug)
+                            self._mark_settlement_stale(slug, settlement)
+                            continue
+
+                    # Check if stale should become abandoned
+                    if settlement.status == "stale":
+                        age_hours = (now - settlement.created_at) / 3600
+                        if age_hours > s_config.stale_max_age_hours:
+                            self._mark_settlement_abandoned(slug)
+                            logging.info(f"[{symbol}] Settlement marked ABANDONED after {age_hours:.1f}h")
+                            continue
+
+                    # Determine poll interval based on status
+                    if settlement.status == "stale":
+                        poll_interval = s_config.stale_check_interval
+                    elif settlement.poll_attempts == 0:
+                        # Initial delay
+                        poll_interval = random.uniform(s_config.initial_delay_min, s_config.initial_delay_max)
+                    elif settlement.poll_attempts <= 5:
+                        poll_interval = s_config.min_interval
+                    else:
+                        # Exponential backoff capped at max_interval
+                        poll_interval = min(s_config.max_interval,
+                                          s_config.min_interval * (s_config.backoff_multiplier ** (settlement.poll_attempts - 5)))
+
+                    # Check if it's time to poll
+                    next_poll_time = settlement.last_poll_time + poll_interval
+                    if settlement.last_poll_time > 0 and now < next_poll_time:
+                        continue
+
+                    # Record poll attempt
+                    self._record_poll_attempt(slug, now)
 
                     # Check resolution
                     is_resolved, winner_outcome, winner_token = executor.get_market_resolution(slug)
 
                     if is_resolved and winner_outcome:
                         # Market resolved!
-                        symbol = settlement.symbol
-
-                        # Get fills
-                        up_filled = settlement.up_filled
-                        down_filled = settlement.down_filled
-                        up_price = settlement.up_avg_price
-                        down_price = settlement.down_avg_price
-
-                        # Fetch fresh if no fills cached
-                        if up_filled == 0 and down_filled == 0:
-                            if settlement.up_order_id:
-                                fresh_up, fresh_up_price = executor.get_fills_for_order(settlement.up_order_id)
-                                if fresh_up > 0:
-                                    up_filled = fresh_up
-                                    if fresh_up_price > 0:
-                                        up_price = fresh_up_price
-
-                            if settlement.down_order_id:
-                                fresh_down, fresh_down_price = executor.get_fills_for_order(settlement.down_order_id)
-                                if fresh_down > 0:
-                                    down_filled = fresh_down
-                                    if fresh_down_price > 0:
-                                        down_price = fresh_down_price
-
-                        # Calculate PnL
-                        if winner_outcome == "UP":
-                            pnl = (up_filled * (1.0 - up_price)) - (down_filled * down_price)
-                        elif winner_outcome == "DOWN":
-                            pnl = (down_filled * (1.0 - down_price)) - (up_filled * up_price)
-                        else:
-                            pnl = 0.0
-
-                        # Mark resolved
-                        self._state.mark_settlement_resolved(slug, winner_outcome, pnl)
-
-                        logging.info(f"[{symbol}] RESOLVED: Winner={winner_outcome}, "
-                                    f"UP={up_filled:.0f}@${up_price:.3f}, DOWN={down_filled:.0f}@${down_price:.3f}, "
-                                    f"PnL=${pnl:+.2f}")
-
-                        # Notify
-                        self._notifier.notify_settlement_result(
-                            symbol=symbol, slug=slug, winner=winner_outcome,
-                            up_filled=up_filled, down_filled=down_filled,
-                            up_cost=up_price, down_cost=down_price, pnl=pnl
-                        )
-
-                        # Redeem if we have winning shares
-                        condition_id = settlement.condition_id
-                        has_winning = False
-                        if winner_outcome == "UP" and up_filled > 0:
-                            has_winning = True
-                        elif winner_outcome == "DOWN" and down_filled > 0:
-                            has_winning = True
-
-                        if condition_id and has_winning:
-                            logging.info(f"[{symbol}] Attempting redeem...")
-                            success, amount = executor.redeem_positions(condition_id)
-                            if success:
-                                self._state.mark_settlement_redeemed(slug)
-                                if amount > 0:
-                                    self._notifier.notify_redeem_success(symbol, slug, amount)
-                                logging.info(f"[{symbol}] Redeemed ${amount:.2f}")
-                            else:
-                                logging.warning(f"[{symbol}] Redeem failed - may need manual")
-                        else:
-                            self._state.mark_settlement_redeemed(slug)
-
-                        # Cleanup
-                        del poll_state[slug]
-                        self._persistence.mark_dirty()
-
+                        self._handle_settlement_resolved(executor, slug, settlement, winner_outcome)
                     else:
-                        # Not resolved yet
-                        state["attempts"] += 1
+                        # Log progress for stale (reduced frequency)
+                        if settlement.status == "stale" and settlement.poll_attempts % 12 == 0:
+                            logging.debug(f"[{symbol}] Stale settlement still unresolved after {settlement.poll_attempts} attempts")
 
-                        # Backoff
-                        if state["attempts"] > 5:
-                            state["interval"] = min(s_config.max_interval,
-                                                   state["interval"] * s_config.backoff_multiplier)
-
-                        state["next_check"] = now + state["interval"]
-
-                        # Check timeout
-                        elapsed_since_expiry = now - state["start_time"]
-                        max_wait = s_config.max_wait_minutes * 60
-
-                        if elapsed_since_expiry > max_wait:
-                            symbol = settlement.symbol
-
-                            # Notify once
-                            if slug not in timeout_notified:
-                                logging.warning(f"[{symbol}] Settlement timeout after {state['attempts']} attempts")
-                                if s_config.notify_once_on_timeout:
-                                    self._notifier.notify_settlement_timeout(symbol, slug, state["attempts"])
-                                timeout_notified.add(slug)
-
-                            # Stop polling this market
-                            del poll_state[slug]
-
-                # Cleanup old settlements
-                self._state.cleanup_old_settlements()
+                # Cleanup old settlements (abandoned + old redeemed)
+                self._cleanup_old_settlements(s_config.cleanup_abandoned_hours)
 
                 time.sleep(5)
 
@@ -744,6 +698,118 @@ class SniperEngine:
                 time.sleep(30)
 
         logging.info("Settlement watcher stopped")
+
+    def _mark_settlement_stale(self, slug: str, settlement):
+        """Mark settlement as stale (reduced polling)"""
+        with self._state._data_lock:
+            if slug in self._state._state["pending_settlements"]:
+                self._state._state["pending_settlements"][slug].status = "stale"
+                self._persistence.mark_dirty()
+
+    def _mark_settlement_timeout_notified(self, slug: str):
+        """Mark that timeout notification was sent"""
+        with self._state._data_lock:
+            if slug in self._state._state["pending_settlements"]:
+                self._state._state["pending_settlements"][slug].timeout_notified = True
+
+    def _mark_settlement_abandoned(self, slug: str):
+        """Mark settlement as abandoned (stop polling)"""
+        with self._state._data_lock:
+            if slug in self._state._state["pending_settlements"]:
+                self._state._state["pending_settlements"][slug].status = "abandoned"
+                self._persistence.mark_dirty()
+
+    def _record_poll_attempt(self, slug: str, timestamp: float):
+        """Record a poll attempt for a settlement"""
+        with self._state._data_lock:
+            if slug in self._state._state["pending_settlements"]:
+                self._state._state["pending_settlements"][slug].poll_attempts += 1
+                self._state._state["pending_settlements"][slug].last_poll_time = timestamp
+
+    def _handle_settlement_resolved(self, executor, slug: str, settlement, winner_outcome: str):
+        """Handle a resolved settlement"""
+        symbol = settlement.symbol
+
+        # Get fills
+        up_filled = settlement.up_filled
+        down_filled = settlement.down_filled
+        up_price = settlement.up_avg_price
+        down_price = settlement.down_avg_price
+
+        # Fetch fresh if no fills cached
+        if up_filled == 0 and down_filled == 0:
+            if settlement.up_order_id:
+                fresh_up, fresh_up_price = executor.get_fills_for_order(settlement.up_order_id)
+                if fresh_up > 0:
+                    up_filled = fresh_up
+                    if fresh_up_price > 0:
+                        up_price = fresh_up_price
+
+            if settlement.down_order_id:
+                fresh_down, fresh_down_price = executor.get_fills_for_order(settlement.down_order_id)
+                if fresh_down > 0:
+                    down_filled = fresh_down
+                    if fresh_down_price > 0:
+                        down_price = fresh_down_price
+
+        # Calculate PnL
+        if winner_outcome == "UP":
+            pnl = (up_filled * (1.0 - up_price)) - (down_filled * down_price)
+        elif winner_outcome == "DOWN":
+            pnl = (down_filled * (1.0 - down_price)) - (up_filled * up_price)
+        else:
+            pnl = 0.0
+
+        # Mark resolved
+        self._state.mark_settlement_resolved(slug, winner_outcome, pnl)
+
+        logging.info(f"[{symbol}] RESOLVED: Winner={winner_outcome}, "
+                    f"UP={up_filled:.0f}@${up_price:.3f}, DOWN={down_filled:.0f}@${down_price:.3f}, "
+                    f"PnL=${pnl:+.2f}")
+
+        # Notify
+        self._notifier.notify_settlement_result(
+            symbol=symbol, slug=slug, winner=winner_outcome,
+            up_filled=up_filled, down_filled=down_filled,
+            up_cost=up_price, down_cost=down_price, pnl=pnl
+        )
+
+        # Redeem if we have winning shares
+        condition_id = settlement.condition_id
+        has_winning = False
+        if winner_outcome == "UP" and up_filled > 0:
+            has_winning = True
+        elif winner_outcome == "DOWN" and down_filled > 0:
+            has_winning = True
+
+        if condition_id and has_winning:
+            logging.info(f"[{symbol}] Attempting redeem...")
+            success, amount = executor.redeem_positions(condition_id)
+            if success:
+                self._state.mark_settlement_redeemed(slug)
+                if amount > 0:
+                    self._notifier.notify_redeem_success(symbol, slug, amount)
+                logging.info(f"[{symbol}] Redeemed ${amount:.2f}")
+            else:
+                logging.warning(f"[{symbol}] Redeem failed - may need manual")
+        else:
+            self._state.mark_settlement_redeemed(slug)
+
+        self._persistence.mark_dirty()
+
+    def _cleanup_old_settlements(self, cleanup_hours: float):
+        """Cleanup old settlements (abandoned + old redeemed)"""
+        now = time.time()
+        cutoff = now - (cleanup_hours * 3600)
+
+        with self._state._data_lock:
+            old_slugs = [
+                slug for slug, data in self._state._state["pending_settlements"].items()
+                if data.status in ["redeemed", "abandoned"] and data.created_at < cutoff
+            ]
+            for slug in old_slugs:
+                del self._state._state["pending_settlements"][slug]
+                logging.debug(f"Cleaned up old settlement: {slug[-20:]}")
 
     def _cleanup_worker(self):
         """Cleanup worker for old records"""

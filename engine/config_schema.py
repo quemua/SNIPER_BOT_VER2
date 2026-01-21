@@ -79,9 +79,15 @@ class SettlementConfig:
     max_interval: float = 60.0
     backoff_multiplier: float = 1.5
 
-    # Give up settings
+    # Give up settings (active polling)
     max_wait_minutes: float = 30.0
+    max_attempts: int = 200  # Max attempts before marking stale
     notify_once_on_timeout: bool = True
+
+    # Stale state settings (reduced polling for very old settlements)
+    stale_check_interval: float = 300.0  # 5 minutes between checks for stale
+    stale_max_age_hours: float = 24.0  # Mark as abandoned after this
+    cleanup_abandoned_hours: float = 48.0  # Remove abandoned records after this
 
 
 @dataclass
@@ -279,6 +285,11 @@ class SniperConfigSchema:
         s.backoff_multiplier = max(1.1, min(3.0, s.backoff_multiplier))
 
         s.max_wait_minutes = max(10.0, min(60.0, s.max_wait_minutes))
+        s.max_attempts = max(50, min(500, s.max_attempts))
+
+        s.stale_check_interval = max(60.0, min(600.0, s.stale_check_interval))
+        s.stale_max_age_hours = max(6.0, min(48.0, s.stale_max_age_hours))
+        s.cleanup_abandoned_hours = max(s.stale_max_age_hours, min(168.0, s.cleanup_abandoned_hours))
 
     def _validate_fill_monitor(self):
         """Validate fill monitor configuration"""

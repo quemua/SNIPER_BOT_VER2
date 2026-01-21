@@ -53,10 +53,13 @@ class SettlementRecord:
     down_price_source: str = "sniper"
     up_notified: bool = False
     down_notified: bool = False
-    status: str = "pending"  # pending, resolved, redeemed
+    status: str = "pending"  # pending, stale, abandoned, resolved, redeemed
     winner: Optional[str] = None
     pnl: float = 0.0
     created_at: float = field(default_factory=time.time)
+    poll_attempts: int = 0
+    timeout_notified: bool = False
+    last_poll_time: float = 0.0
 
 
 class StateManager:
@@ -487,6 +490,9 @@ class StateManager:
                             "winner": s.winner,
                             "pnl": s.pnl,
                             "created_at": s.created_at,
+                            "poll_attempts": s.poll_attempts,
+                            "timeout_notified": s.timeout_notified,
+                            "last_poll_time": s.last_poll_time,
                         }
                         for slug, s in self._state["pending_settlements"].items()
                     },
@@ -526,6 +532,9 @@ class StateManager:
                             winner=s_data.get("winner"),
                             pnl=s_data.get("pnl", 0),
                             created_at=s_data.get("created_at", time.time()),
+                            poll_attempts=s_data.get("poll_attempts", 0),
+                            timeout_notified=s_data.get("timeout_notified", False),
+                            last_poll_time=s_data.get("last_poll_time", 0.0),
                         )
                 if "total_wins" in data:
                     self._state["total_wins"] = data["total_wins"]

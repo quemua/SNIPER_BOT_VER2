@@ -18,6 +18,10 @@ Environment Variables:
     PROXY_URL         Optional: Proxy URL
     TELEGRAM_BOT_TOKEN  Optional: Telegram notifications
     TELEGRAM_CHAT_ID    Optional: Telegram chat ID
+
+Windows Service:
+    To run as Windows service, use NSSM or Task Scheduler.
+    See docs/windows_service.md for details.
 """
 import os
 import sys
@@ -25,6 +29,7 @@ import argparse
 import signal
 import time
 import logging
+import platform
 from pathlib import Path
 
 # Add project root to path
@@ -132,15 +137,14 @@ def main():
     # Setup signal handlers for graceful shutdown
     shutdown_requested = False
 
-    def signal_handler(signum, frame):
+    def graceful_shutdown(reason: str = "signal"):
         nonlocal shutdown_requested
         if shutdown_requested:
             logging.warning("Force shutdown...")
             sys.exit(1)
 
         shutdown_requested = True
-        sig_name = signal.Signals(signum).name
-        logging.info(f"Received {sig_name}, shutting down gracefully...")
+        logging.info(f"Shutdown requested ({reason}), stopping gracefully...")
 
         # Stop engine
         stop_engine()
@@ -156,10 +160,48 @@ def main():
         )
 
         logging.info("Shutdown complete")
+
+    def signal_handler(signum, frame):
+        try:
+            sig_name = signal.Signals(signum).name
+        except (ValueError, AttributeError):
+            sig_name = str(signum)
+        graceful_shutdown(f"signal {sig_name}")
         sys.exit(0)
 
+    # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+
+    # SIGTERM may not work on Windows depending on how process is started
+    if platform.system() != "Windows":
+        signal.signal(signal.SIGTERM, signal_handler)
+    else:
+        # Windows: Use SIGBREAK for console close events
+        try:
+            signal.signal(signal.SIGBREAK, signal_handler)
+        except (AttributeError, ValueError):
+            pass  # SIGBREAK not available
+
+    # Windows: Register console control handler for more events
+    if platform.system() == "Windows":
+        try:
+            import win32api
+            import win32con
+
+            def windows_console_handler(ctrl_type):
+                if ctrl_type in (win32con.CTRL_C_EVENT,
+                                win32con.CTRL_BREAK_EVENT,
+                                win32con.CTRL_CLOSE_EVENT,
+                                win32con.CTRL_LOGOFF_EVENT,
+                                win32con.CTRL_SHUTDOWN_EVENT):
+                    graceful_shutdown(f"windows_ctrl_{ctrl_type}")
+                    return True
+                return False
+
+            win32api.SetConsoleCtrlHandler(windows_console_handler, True)
+            logging.info("Windows console handler registered")
+        except ImportError:
+            logging.debug("pywin32 not installed, using basic signal handling")
 
     # Start engine
     logging.info("Starting sniper engine...")
